@@ -1,0 +1,16 @@
+# 运行状态：bot 凭据、联系人、轮询游标都在这里，**绝对不要提交**。
+wxpush.json
+wxpush.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境与编辑器
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+.DS_Store
