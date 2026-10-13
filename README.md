@@ -226,6 +226,8 @@ base_url   : https://ilinkai.weixin.qq.com
 
 对方回一条，计时就重置；不回的话，每 2 小时才再提醒一次，不会刷屏。提醒发送失败的原因会被记下来，在 `python wxpush.py keepalive` 或者 `/api/status` 里能看到。
 
+**发送失败不会一直重试。** 如果后端明确拒绝（`-14`，或 `-2 prepare failed`），说明凭据已经不可用，本地再怎么试都不会成功 —— 这时服务会**停止**对这个联系人的重试，不会再每分钟刷一条一模一样的错误日志，等对方发来消息换发新凭据、或者你重新 `login` 之后自动恢复。`python wxpush.py keepalive` 的「状态」列和 `/api/status` 里的 `keepalive.suspended` 能看到谁被暂停了。传输层错误（超时、连不上）属于暂时性故障，不会判定成凭据失效，只是按上面的重复间隔限速重试。
+
 ```bash
 python wxpush.py keepalive            # 看每个联系人的 token 龄和倒计时
 python wxpush.py keepalive --now      # 立即发一条，验证链路是通的
@@ -292,6 +294,8 @@ python wxpush.py set --keepalive-off  # 关掉
 **联系人显示 `stale_suspected`** —— 距 TA 上次说话超过约 24 小时了。发送还是会尝试，只是成功率不高，最好先提醒对方一句。
 
 **轮询显示 paused** —— 后端返回了 `-14`，也就是 bot token 陈旧，轮询暂停一小时。要是反复出现，重新执行 `python wxpush.py login`。
+
+**保活提醒不再重试了** —— 后端已经明确拒绝发送（`-14` / `-2 prepare failed`），说明凭据不可用，服务停止刷日志等你处理。让对方给机器人发一条消息，或者 `python wxpush.py login` 重新登录，就会自动恢复；`python wxpush.py keepalive` 的「状态」列能看到哪些联系人被暂停。想立刻强制再试一次用 `keepalive --now`。
 
 **端口被占用** —— `python wxpush.py --port 9000`，或者用 `set --port 9000` 永久改掉。
 

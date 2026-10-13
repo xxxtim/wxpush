@@ -419,8 +419,14 @@ class Contact:
     #: 最近一次**发出**消息给该用户的时间。
     last_sent_at: int = 0
     message_count: int = 0
-    #: 上次发出保活提醒的时间；收到新消息（换发新 token）时清零。
+    #: 上次**成功**发出保活提醒的时间；收到新消息（换发新 token）时清零。
     keepalive_reminded_at: int = 0
+    #: 上次保活提醒**发送失败**的时间。用来给失败后的重试限速：没有它，
+    #: 检查周期（60 秒）一到就会拿同一个失效的 token 反复重试、反复刷日志。
+    keepalive_failed_at: int = 0
+    #: 判定「凭据已不可用」时该联系人的 context_token。非空且与当前 token
+    #: 相同时，说明这期间没收到过新消息 —— 再提醒也不可能成功，直接跳过。
+    keepalive_failed_token: str = ""
 
     @property
     def age_s(self) -> int | None:
@@ -523,6 +529,9 @@ class State:
             contact.context_token = context_token
             contact.token_updated_at = int(time.time())
             contact.keepalive_reminded_at = 0
+            # 换了新凭据，之前判定「发不出去」的结论作废，重新开始计时。
+            contact.keepalive_failed_at = 0
+            contact.keepalive_failed_token = ""
         contact.last_message_at = int(time.time())
         if create_time_ms:
             contact.last_message_at = max(contact.last_message_at,
@@ -549,6 +558,8 @@ class State:
                 last_sent_at=int(value.get("last_sent_at") or 0),
                 message_count=int(value.get("message_count") or 0),
                 keepalive_reminded_at=int(value.get("keepalive_reminded_at") or 0),
+                keepalive_failed_at=int(value.get("keepalive_failed_at") or 0),
+                keepalive_failed_token=str(value.get("keepalive_failed_token") or ""),
             )
         return cls(
             token=str(raw.get("token") or ""),
@@ -966,6 +977,9 @@ class KeepaliveMonitor:
     keepalive_repeat_hours 重复提醒，不刷屏。
     """
 
+    #: 后端明确表示「凭据不可用」的返回码；这类失败重试不会成功。
+    DEAD_CREDENTIAL_RETS = (STALE_TOKEN_ERRCODE, PREPARE_FAILED_RET)
+
     def __init__(self, store: StateStore,
                  client_factory: Callable[[str, str], WeixinClient] | None = None):
         self.store = store
@@ -1003,7 +1017,15 @@ class KeepaliveMonitor:
                 return
 
     def due_contacts(self, state: State, *, now: float | None = None) -> list[Contact]:
-        """列出当前需要提醒的联系人。"""
+        """列出当前需要提醒的联系人。
+
+        三种「不该再提醒」的情况都会被跳过：
+        1. token 还年轻，没到阈值；
+        2. 上次提醒发出去了，重复间隔没到（不刷屏）；
+        3. 凭据已经被后端判定失效 —— 除非后来又收到过消息（token 变了），
+           否则重试永远不会成功，只会白刷日志。
+        另外失败后的重试也按重复间隔限速，避免每个检查周期重试一次。
+        """
         if not state.keepalive_enabled:
             return []
         now = now if now is not None else time.time()
@@ -1015,8 +1037,14 @@ class KeepaliveMonitor:
                 continue
             if now - contact.token_updated_at < after_s:
                 continue
+            if (contact.keepalive_failed_token
+                    and contact.keepalive_failed_token == contact.context_token):
+                continue
             if (contact.keepalive_reminded_at
                     and now - contact.keepalive_reminded_at < repeat_s):
+                continue
+            if (contact.keepalive_failed_at
+                    and now - contact.keepalive_failed_at < repeat_s):
                 continue
             due.append(contact)
         return due
@@ -1035,6 +1063,7 @@ class KeepaliveMonitor:
         if not due:
             return 0
 
+        stamp = int(now if now is not None else time.time())
         sent = 0
         for contact in due:
             body = build_text_message(contact.user_id, self.build_reminder(contact),
@@ -1042,27 +1071,37 @@ class KeepaliveMonitor:
             try:
                 self._client_factory(state.base_url, state.token).send_message(body)
             except BusinessError as exc:
+                # -14 / -2 都是「凭据不可用」，本地怎么重试都不会成功。
+                dead = (exc.ret in self.DEAD_CREDENTIAL_RETS
+                        or exc.errcode in self.DEAD_CREDENTIAL_RETS)
                 if exc.ret == STALE_TOKEN_ERRCODE or exc.errcode == STALE_TOKEN_ERRCODE:
                     self.last_error = ("保活提醒发送失败：token 已失效（-14），"
                                        "请手动让对方发一条消息")
-                elif exc.ret == PREPARE_FAILED_RET:
+                elif exc.ret == PREPARE_FAILED_RET or exc.errcode == PREPARE_FAILED_RET:
                     self.last_error = (f"保活提醒发送失败：{exc} —— 会话 token 可能"
                                        f"已不可用，请手动让对方给机器人发一条消息")
                 else:
                     self.last_error = f"保活提醒发送失败：{exc}"
+                if dead:
+                    self.last_error += "（已暂停对该联系人的重试，收到来信或重新登录后自动恢复）"
                 logger.error("%s", self.last_error)
+                self._record_failure(contact.user_id, contact.context_token,
+                                     dead=dead, stamp=stamp)
                 continue
             except (ApiError, OSError) as exc:
+                # 传输层错误多半是暂时的：只按重复间隔限速重试，不判定凭据失效。
                 self.last_error = f"保活提醒发送失败：{exc}"
                 logger.error("%s", self.last_error)
+                self._record_failure(contact.user_id, contact.context_token,
+                                     dead=False, stamp=stamp)
                 continue
-
-            stamp = int(now if now is not None else time.time())
 
             def mark(state_: State, uid=contact.user_id, ts=stamp) -> None:
                 target = state_.contacts.get(uid)
                 if target is not None:
                     target.keepalive_reminded_at = ts
+                    target.keepalive_failed_at = 0
+                    target.keepalive_failed_token = ""
                     # 提醒也是一次「发出」，但不碰 last_message_at（那是来信时间）。
                     target.last_sent_at = ts
 
@@ -1075,12 +1114,39 @@ class KeepaliveMonitor:
                         contact.user_id, (contact.age_s or 0) / 3600)
         return sent
 
+    def _record_failure(self, user_id: str, token: str, *, dead: bool,
+                        stamp: int) -> None:
+        """记下这次失败，用来给重试限速。
+
+        `dead=True` 表示后端明确说凭据不可用：连同当时的 context_token 一起记下，
+        在收到新消息（token 被换掉）之前都不再重试 —— 重试不可能成功，只会刷日志。
+        """
+        def apply(state: State) -> None:
+            contact = state.contacts.get(user_id)
+            if contact is None:
+                return
+            contact.keepalive_failed_at = stamp
+            # 发送期间刚好收到了新消息，就当作没暂停过：那个新 token 值得试。
+            if dead and contact.context_token == token:
+                contact.keepalive_failed_token = token
+
+        self.store.update(apply)
+
+    def suspended_contacts(self) -> list[str]:
+        """凭据已被判定失效、当前不会再重试的联系人。"""
+        state = self.store.load()
+        return sorted(c.user_id for c in state.contacts.values()
+                      if c.keepalive_failed_token
+                      and c.keepalive_failed_token == c.context_token)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "running": self.running,
             "reminders_sent": self.reminders_sent,
             "last_reminder_at": int(self.last_reminder_at) if self.last_reminder_at else 0,
             "last_error": self.last_error,
+            # 凭据失效、已停止重试的联系人（收到来信或重新登录后自动移出）。
+            "suspended": self.suspended_contacts(),
         }
 
 
@@ -1417,6 +1483,10 @@ def perform_login(store: StateStore, *, quiet: bool = False) -> int:
         state.user_id = outcome.user_id
         state.saved_at = int(time.time())
         state.sync_buf = ""  # 新会话，游标重置
+        # 换了登录凭据：之前判定「发不出去」的会话值得再试一次。
+        for contact in state.contacts.values():
+            contact.keepalive_failed_at = 0
+            contact.keepalive_failed_token = ""
 
     store.update(apply)
     print("登录成功，凭据已保存。")
@@ -1662,6 +1732,9 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
             s.keepalive_after_hours = 0.0
             for contact in s.contacts.values():
                 contact.keepalive_reminded_at = 0
+                # 手动强制：把「已暂停重试」和失败限速一并清掉，真的再试一次。
+                contact.keepalive_failed_at = 0
+                contact.keepalive_failed_token = ""
 
         store.update(force)
         monitor = KeepaliveMonitor(store)
@@ -1682,7 +1755,8 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
     if not state.contacts:
         print("还没有联系人（没有 token 可保活）。")
         return 0
-    print(f"  {'user_id':<34} {'token 龄':>10}  {'距提醒':>10}  上次提醒")
+    print(f"  {'user_id':<34} {'token 龄':>10}  {'距提醒':>10}  {'上次提醒':<16} 状态")
+    suspended: list[str] = []
     for contact in state.sorted_contacts():
         age = contact.age_s
         age_text = f"{age / 3600:.1f}h" if age is not None else "-"
@@ -1693,7 +1767,25 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
             remain = f"{remain_s / 3600:.1f}h" if remain_s > 0 else "已到期"
         reminded = (time.strftime("%m-%d %H:%M", time.localtime(
             contact.keepalive_reminded_at)) if contact.keepalive_reminded_at else "从未")
-        print(f"  {contact.user_id[:33]:<34} {age_text:>10}  {remain:>10}  {reminded}")
+        if (contact.keepalive_failed_token
+                and contact.keepalive_failed_token == contact.context_token):
+            note = "已暂停重试（凭据失效，等对方来信）"
+            suspended.append(contact.user_id)
+        elif contact.keepalive_failed_at:
+            note = ("上次失败 "
+                    + time.strftime("%m-%d %H:%M",
+                                    time.localtime(contact.keepalive_failed_at)))
+        else:
+            note = ""
+        print(f"  {contact.user_id[:33]:<34} {age_text:>10}  {remain:>10}  "
+              f"{reminded:<16} {note}".rstrip())
+    if suspended:
+        print()
+        print("「已暂停重试」表示后端已明确拒绝发送（凭据不可用），服务不会再每隔"
+              "一分钟重试。恢复方式：")
+        print("  1. 让对方给机器人发一条消息（换发新凭据，自动恢复）；")
+        print("  2. 或者 `python wxpush.py login` 重新登录；")
+        print("  3. 想立刻强制再试一次：`python wxpush.py keepalive --now`。")
     print()
     print("用 `python wxpush.py keepalive --now` 可立即发一条提醒来验证链路。")
     return 0
